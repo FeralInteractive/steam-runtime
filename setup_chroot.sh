@@ -372,17 +372,19 @@ main()
 }
 
 # Launch ourselves with script so we can time this and get a log file
-if [[ ! -v SETUP_CHROOT_LOGGING_STARTED ]]; then
-	if command -v script >/dev/null; then
-		export SETUP_CHROOT_LOGGING_STARTED=1
-		export SHELL=/bin/bash
-		script --return --command "time $SCRIPT $(sh_quote "$@")" "${LOGFILE}"
-		exit $?
-	else
-		echo >&2 "!! 'script' command not found, will not auto-generate a log file"
+# HACKY HACK: disable this, as I can't interact with sudo and enter a password
+# when script is redirecting input and output.
+#if [[ ! -v SETUP_CHROOT_LOGGING_STARTED ]]; then
+#	if command -v script >/dev/null; then
+#		export SETUP_CHROOT_LOGGING_STARTED=1
+#		export SHELL=/bin/bash
+#		script --return --command "time $SCRIPT $(sh_quote "$@")" "${LOGFILE}"
+#		exit $?
+#	else
+#		echo >&2 "!! 'script' command not found, will not auto-generate a log file"
 		# Continue to main
-	fi
-fi
+#	fi
+#fi
 
 main "$@"
 
