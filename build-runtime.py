@@ -8,6 +8,7 @@ import errno
 import os
 import re
 import sys
+import glob
 import gzip
 import hashlib
 import shutil
@@ -46,6 +47,11 @@ ONE_MEGABYTE = 1024 * 1024
 SPLIT_MEGABYTES = 50
 MIN_PARTS = 3
 
+ARCHITECTURES = {
+	'amd64': 'x86_64-linux-gnu',
+	'i386': 'i386-linux-gnu',
+}
+
 
 def mkdir_p(path):
 	"""
@@ -71,6 +77,17 @@ def hard_link_or_copy(source, dest):
 		os.link(source, dest)
 	except OSError:
 		shutil.copyfile(source, dest)
+
+
+def warn_if_different(
+	path1,		# type: str
+	path2		# type: str
+):
+	# type: (...) -> None
+	# Deliberately ignoring exit status
+	subprocess.call([
+		'diff', '--brief', '--', path1, path2,
+	])
 
 
 def str2bool (b):
@@ -147,13 +164,9 @@ class AptSource:
 
 	def get_packages_urls(self, arch, dbgsym=False):
 		# type: (str, bool) -> typing.List[str]
+
 		if self.kind != 'deb':
 			return []
-
-		if dbgsym:
-			maybe_debug = 'debug/'
-		else:
-			maybe_debug = ''
 
 		if self.suite.endswith('/') and not self.components:
 			suite = self.suite
@@ -163,12 +176,23 @@ class AptSource:
 
 			return ['%s/%sPackages.gz' % (self.url, suite)]
 
-		return [
-			"%s/dists/%s/%s/%sbinary-%s/Packages.gz" % (
-				self.url, self.suite, component,
-				maybe_debug, arch)
-			for component in self.components
-		]
+		ret = []		# type: typing.List[str]
+
+		for component in self.components:
+			ret.append(
+				"%s/dists/%s/%s/binary-%s/Packages.gz" % (
+					self.url, self.suite, component,
+					arch)
+			)
+
+			if dbgsym:
+				ret.append(
+					"%s/dists/%s/%s/debug/binary-%s/Packages.gz" % (
+						self.url, self.suite,
+						component, arch)
+				)
+
+		return ret
 
 
 def parse_args():
@@ -258,10 +282,18 @@ def parse_args():
 			% args.output)
 
 	if not args.architectures:
-		args.architectures = ['amd64', 'i386']
+		args.architectures = sorted(ARCHITECTURES.keys())
 
 	if not args.packages_from and not args.metapackages:
-		args.packages_from = ['packages.txt']
+		args.metapackages = ['steamrt-libs', 'steamrt-legacy']
+
+		if args.debug:
+			args.metapackages.append('steamrt-libdevel')
+			args.metapackages.append('steamrt-libdevel-non-multiarch')
+			# Not really a metapackage, but we want it in the
+			# debug tarball only; container/chroot/Docker
+			# environments get libgl1-mesa-dev instead
+			args.metapackages.append('dummygl-dev')
 
 	return args
 
@@ -273,7 +305,11 @@ def download_file(file_url, file_path):
 	except OSError:
 		pass
 
-	urlretrieve(file_url, file_path)
+	try:
+		urlretrieve(file_url, file_path)
+	except Exception:
+		sys.stderr.write('Error downloading %s:\n' % file_url)
+		raise
 	return True
 
 
@@ -308,6 +344,12 @@ def install_sources(apt_sources, sourcelist):
 	# of completeness and download all of them.
 	for sp in source_packages:
 		p = sp.stanza['package']
+
+		# Skip packages with Extra-Source-Only: yes.
+		# These don't necessarily appear in the package pool.
+		if sp.stanza.get('Extra-Source-Only', 'no') == 'yes':
+			continue
+
 		if p in sourcelist:
 			if args.verbose:
 				print("DOWNLOADING SOURCE: %s" % p)
@@ -495,8 +537,18 @@ def ignore_metapackage_dependency(name):
 	return name in (
 		# Must be provided by host system
 		'libc6',
+		'libegl-mesa0',
+		'libegl1-mesa',
+		'libegl1-mesa-drivers',
 		'libgl1-mesa-dri',
 		'libgl1-mesa-glx',
+		'libgles1-mesa',
+		'libgles2-mesa',
+		'libglx-mesa0',
+		'mesa-opencl-icd',
+		'mesa-va-drivers',
+		'mesa-vdpau-drivers',
+		'mesa-vulkan-drivers',
 
 		# Provided by host system alongside Mesa if needed
 		'libtxc-dxtn-s2tc0',
@@ -521,6 +573,7 @@ def accept_transitive_dependency(name):
 		'gcc-4.8-base',
 		'gcc-4.9-base',
 		'gcc-5-base',
+		'libelf1',
 		'libx11-data',
 	)
 
@@ -534,8 +587,18 @@ def ignore_transitive_dependency(name):
 	return name in (
 		# Must be provided by host system
 		'libc6',
+		'libegl-mesa0',
+		'libegl1-mesa',
+		'libegl1-mesa-drivers',
 		'libgl1-mesa-dri',
 		'libgl1-mesa-glx',
+		'libgles1-mesa',
+		'libgles2-mesa',
+		'libglx-mesa0',
+		'mesa-opencl-icd',
+		'mesa-va-drivers',
+		'mesa-vdpau-drivers',
+		'mesa-vulkan-drivers',
 
 		# Assumed to be provided by host system if needed
 		'ca-certificates',
@@ -552,7 +615,6 @@ def ignore_transitive_dependency(name):
 		'libdrm-radeon1',
 		'libdrm-nouveau1a',
 		'libdrm2',
-		'libgdk-pixbuf2.0-common',
 		'libglapi-mesa',
 		'libllvm3.0',
 		'libopenal-data',
@@ -563,6 +625,10 @@ def ignore_transitive_dependency(name):
 		'shared-mime-info',
 		'sound-theme-freedesktop',
 		'x11-common',
+
+		# Non-essential: only contains localizations
+		'libgdk-pixbuf2.0-common',
+		'libjson-glib-1.0-common',
 
 		# Depended on by packages that are present for historical
 		# reasons
@@ -607,51 +673,69 @@ def expand_metapackages(binaries_by_arch, metapackages):
 
 	for arch, arch_binaries in sorted(binaries_by_arch.items()):
 		for library in sorted(binaries_from_apt[arch]):
-			if library not in arch_binaries:
-				print('ERROR: Package %s not found in Packages files' % library)
+			if not _recurse_dependency(
+				arch_binaries,
+				library,
+				binaries_from_apt[arch],
+				sources_from_apt,
+			):
 				error = True
-				continue
-
-			binary = max(
-				arch_binaries[library],
-				key=lambda b: Version(b.stanza['Version']))
-
-			for d in binary.dependency_names:
-				if accept_transitive_dependency(d):
-					binaries_from_apt[arch].add(d)
-
-	for arch, arch_binaries in sorted(binaries_by_arch.items()):
-		for library in sorted(binaries_from_apt[arch]):
-			if library not in arch_binaries:
-				print('ERROR: Package %s not found in Packages files' % library)
-				error = True
-				continue
-
-			binary = max(
-				arch_binaries[library],
-				key=lambda b: Version(b.stanza['Version']))
-			sources_from_apt.add(binary.source)
-
-			for d in binary.dependency_names:
-				if library.endswith(('-dev', '-dbg', '-multidev')):
-					# When building a -debug runtime we
-					# disregard transitive dependencies of
-					# development-only packages
-					pass
-				elif d in binaries_from_apt[arch]:
-					pass
-				elif ignore_metapackage_dependency(d):
-					pass
-				elif ignore_transitive_dependency(d):
-					pass
-				else:
-					print('ERROR: %s depends on %s but the metapackages do not' % (library, d))
-					error = True
 
 	if error and args.strict:
 		sys.exit(1)
 
 	return sources_from_apt, binaries_from_apt
+
+
+def _recurse_dependency(
+	arch_binaries,			# type: typing.Dict[str, typing.List[Binary]]
+	library,			# type: str
+	binaries_from_apt,		# type: typing.Set[str]
+	sources_from_apt		# type: typing.Set[str]
+):
+	if library not in arch_binaries:
+		print('ERROR: Package %s not found in Packages files' % library)
+		return False
+
+	binary = max(
+		arch_binaries[library],
+		key=lambda b: Version(b.stanza['Version']))
+	sources_from_apt.add(binary.source)
+	error = False
+
+	for d in binary.dependency_names:
+		if accept_transitive_dependency(d):
+			if d not in binaries_from_apt:
+				binaries_from_apt.add(d)
+				if not _recurse_dependency(
+					arch_binaries,
+					d,
+					binaries_from_apt,
+					sources_from_apt,
+				):
+					error = True
+		elif library.endswith(('-dev', '-dbg', '-multidev')):
+			# When building a -debug runtime we
+			# disregard transitive dependencies of
+			# development-only packages
+			pass
+		elif d in binaries_from_apt:
+			pass
+		elif ignore_metapackage_dependency(d):
+			pass
+		elif ignore_transitive_dependency(d):
+			pass
+		else:
+			print('ERROR: %s depends on %s but the metapackages do not' % (library, d))
+			_recurse_dependency(
+				arch_binaries,
+				d,
+				binaries_from_apt,
+				sources_from_apt,
+			)
+			error = True
+
+	return not error
 
 
 def check_consistency(
@@ -748,6 +832,89 @@ def install_binaries(binaries_by_arch, binarylists, manifest):
 		if installset and args.strict:
 			raise SystemExit('Not all binary packages were found')
 
+		# Combine basically all directories, except for {usr/,}{s,}bin
+		# which collides (see
+		# templates/scripts/check-runtime-conflicts.sh) and installed
+		# which is only metadata anyway
+		for pattern in ('*', 'usr/*'):
+			for dir in glob.glob(os.path.join(args.output, arch, pattern)):
+				if dir.endswith(('/bin', '/sbin', '/usr')):
+					# Don't merge bin, sbin - they
+					# will definitely collide.
+					# Don't merge all of usr - we merge its
+					# subdirectories instead, because we
+					# want to skip usr/bin and usr/sbin.
+					continue
+
+				for (dirpath, dirnames, filenames) in os.walk(dir):
+					relative_path = os.path.relpath(
+						dirpath,
+						os.path.join(args.output, arch),
+					)
+
+					for member in dirnames:
+						merged = os.path.join(
+							args.output,
+							relative_path,
+							member,
+						)
+						mkdir_p(merged)
+
+					for member in filenames:
+						source = os.path.join(
+							dirpath,
+							member,
+						)
+						merged = os.path.join(
+							args.output,
+							relative_path,
+							member,
+						)
+						if os.path.exists(merged):
+							warn_if_different(source, merged)
+						else:
+							mkdir_p(os.path.dirname(merged))
+							shutil.move(source, merged)
+
+				# Replace amd64/usr/lib with a symlink to
+				# ../usr/lib, etc.
+				relative_path = os.path.relpath(
+					dir,
+					os.path.join(args.output, arch),
+				)
+				merged = os.path.join(
+					args.output,
+					relative_path,
+				)
+				shutil.rmtree(dir)
+				os.symlink(
+					os.path.join(
+						'../' * (relative_path.count('/') + 1),
+						relative_path,
+					),
+					dir,
+				)
+
+		for pattern in ('bin/{}-*', 'usr/bin/{}-*'):
+			for exe in glob.glob(
+				os.path.join(
+					args.output, arch,
+					pattern.format(ARCHITECTURES[arch]),
+				)
+			):
+				# Populate OUTPUT/usr/bin with symlinks
+				# to OUTPUT/amd64/[usr/]bin/x86_64-linux-gnu-*
+				# and OUTPUT/i386/[usr/]bin/i386-linux-gnu-*
+				mkdir_p(os.path.join(args.output, 'usr', 'bin'))
+				relative_path = os.path.relpath(exe, args.output)
+				os.symlink(
+					os.path.join('..', '..', relative_path),
+					os.path.join(
+						args.output, 'usr', 'bin',
+						os.path.basename(exe),
+					)
+				)
+
 	if skipped > 0:
 		print("Skipped downloading %i file(s) that were already present." % skipped)
 
@@ -772,6 +939,16 @@ def install_deb (basename, deb, dest_dir):
 	#
 	os.chdir(top)
 	subprocess.check_call(['dpkg-deb', '-x', deb, dest_dir])
+	try:
+		shutil.rmtree(
+			os.path.join(
+				dest_dir, 'usr', 'share', 'doc',
+				'nvidia-cg-toolkit', 'examples',
+			)
+		)
+	except OSError as e:
+		if e.errno != errno.ENOENT:
+			raise
 
 
 def install_symbols(dbgsym_by_arch, binarylist, manifest):
@@ -862,23 +1039,22 @@ def install_symbols(dbgsym_by_arch, binarylist, manifest):
 # to their relative equivalent
 #
 def fix_symlinks ():
-	for arch in args.architectures:
-		for dir, subdirs, files in os.walk(os.path.join(args.output, arch)):
-			for name in files:
-				filepath=os.path.join(dir,name)
-				if os.path.islink(filepath):
-					target = os.readlink(filepath)
-					if os.path.isabs(target):
-						#
-						# compute the target of the symlink based on the 'root' of the architecture's runtime
-						#
-						target2 = os.path.join(args.output, arch, target[1:])
+	for dir, subdirs, files in os.walk(args.output):
+		for name in files:
+			filepath=os.path.join(dir,name)
+			if os.path.islink(filepath):
+				target = os.readlink(filepath)
+				if os.path.isabs(target):
+					#
+					# compute the target of the symlink based on the 'root' of the runtime
+					#
+					target2 = os.path.join(args.output, target[1:])
 
-						#
-						# Set the new relative target path
-						#
-						os.unlink(filepath)
-						os.symlink(os.path.relpath(target2,dir), filepath)
+					#
+					# Set the new relative target path
+					#
+					os.unlink(filepath)
+					os.symlink(os.path.relpath(target2,dir), filepath)
 
 
 # Creates the usr/lib/debug/.build-id/xx/xxxxxxxxx.debug symlink tree for all the debug
@@ -904,7 +1080,7 @@ def fix_debuglinks ():
 						linkdir = os.path.join(args.output, arch, "usr/lib/debug/.build-id", m.group(1))
 						if not os.access(linkdir, os.W_OK):
 							os.makedirs(linkdir)
-						link = os.path.join(linkdir,m.group(2))
+						link = os.path.join(linkdir, m.group(2) + '.debug')
 						if args.verbose:
 							print("SYMLINKING symbol file %s to %s" % (link, os.path.relpath(os.path.join(dir,file),linkdir)))
 						if os.path.lexists(link):
@@ -1010,14 +1186,9 @@ if args.verbose:
 	for property, value in sorted(vars(args).items()):
 		print("\t", property, ": ", value)
 
-if args.debug:
-	component = 'debug'
-else:
-	component = 'main'
-
 apt_sources = [
-	AptSource('deb', args.repo, args.suite, (component,)),
-	AptSource('deb-src', args.repo, args.suite, (component,)),
+	AptSource('deb', args.repo, args.suite, ('main',)),
+	AptSource('deb-src', args.repo, args.suite, ('main',)),
 ]
 
 for line in args.extra_apt_sources:
@@ -1073,7 +1244,7 @@ for source in apt_sources:
 				release_info['date'],
 				'%a, %d %b %Y %H:%M:%S %Z',
 			))
-		except ValueError:
+		except (KeyError, ValueError):
 			timestamps[source] = 0
 
 if 'SOURCE_DATE_EPOCH' in os.environ:
@@ -1225,7 +1396,7 @@ if args.archive is not None:
 		compressor_args = ['bzip2', '-c']
 
 	if os.path.isdir(args.archive) or args.archive.endswith('/'):
-		archive_basename = name_version
+		archive_basename = name_version		# type: typing.Optional[str]
 		archive_dir = args.archive
 		archive = os.path.join(archive_dir, archive_basename + ext)
 		make_latest_symlink = (version != 'latest')
@@ -1309,6 +1480,7 @@ if args.archive is not None:
 		))
 
 	if archive_dir is not None:
+		assert archive_basename is not None
 		print("Copying manifest files to %s..." % archive_dir)
 
 		with open(

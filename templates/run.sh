@@ -11,6 +11,16 @@ if [ "$1" = "" ]; then
     exit 1
 fi
 
+if [ -z ${SYSTEM_ZENITY} ]; then
+    # Prefer host zenity binary if available
+    export SYSTEM_ZENITY="$(which zenity 2>/dev/null)"
+    if [ -z ${SYSTEM_ZENITY} ]; then
+        export STEAM_ZENITY="zenity"
+    else
+        export STEAM_ZENITY="${SYSTEM_ZENITY}"
+    fi
+fi
+
 # Note that we put the Steam runtime first
 # If ldd on a program shows any library in the system path, then that program
 # may not run in the Steam runtime.
@@ -32,7 +42,7 @@ if [ "${STEAM_RUNTIME_PREFER_HOST_LIBRARIES-}" != "0" ]; then
     host_library_paths="$STEAM_RUNTIME/pinned_libs_32:$STEAM_RUNTIME/pinned_libs_64:$host_library_paths"
 fi
 
-steam_runtime_library_paths="$host_library_paths$STEAM_RUNTIME/i386/lib/i386-linux-gnu:$STEAM_RUNTIME/i386/lib:$STEAM_RUNTIME/i386/usr/lib/i386-linux-gnu:$STEAM_RUNTIME/i386/usr/lib:$STEAM_RUNTIME/amd64/lib/x86_64-linux-gnu:$STEAM_RUNTIME/amd64/lib:$STEAM_RUNTIME/amd64/usr/lib/x86_64-linux-gnu:$STEAM_RUNTIME/amd64/usr/lib"
+steam_runtime_library_paths="$host_library_paths$STEAM_RUNTIME/lib/i386-linux-gnu:$STEAM_RUNTIME/usr/lib/i386-linux-gnu:$STEAM_RUNTIME/lib/x86_64-linux-gnu:$STEAM_RUNTIME/usr/lib/x86_64-linux-gnu:$STEAM_RUNTIME/lib:$STEAM_RUNTIME/usr/lib"
 
 if [ "$1" = "--print-steam-runtime-library-paths" ]; then
     echo "$steam_runtime_library_paths"
